@@ -1,3 +1,4 @@
+from collections import defaultdict
 from typing import Any, TypedDict, Union
 
 import yaml
@@ -22,7 +23,7 @@ class OutputResolution(BaseModel):
 
 
 class ResolvedIO(TypedDict):
-    inputs: dict[str, InputResolution]
+    inputs: dict[str, list[InputResolution]]
     outputs: dict[str, OutputResolution]
 
 
@@ -50,9 +51,9 @@ def _normalize_declared_path(value: Any) -> Union[str, None]:
 
 
 def _resolve_declared_inputs(
-    declared_map: dict[str, Any],
-    pipeline_meta: dict[str, dict[str, Any]],
-) -> dict[str, InputResolution]:
+        declared_map: dict[str, Any],
+        pipeline_meta: dict[str, dict[str, Any]],
+) -> dict[str, list[InputResolution]]:
     """
     Resolve declared input entries using the pipeline metadata.
 
@@ -63,30 +64,33 @@ def _resolve_declared_inputs(
     Returns:
         A mapping from declared IO name to `InputResolution`.
     """
-    resolutions: dict[str, InputResolution] = {}
-    for io_name, declared_path in declared_map.items():
-        normalized_path = _normalize_declared_path(declared_path)
-        if not isinstance(normalized_path, str) or "." not in normalized_path:
-            continue
+    resolutions = defaultdict(list)
+    for io_name, values in declared_map.items():
+        if not isinstance(values, list):
+            values = [values]
+        for declared_path in values:
+            normalized_path = _normalize_declared_path(declared_path)
+            if not isinstance(normalized_path, str) or "." not in normalized_path:
+                continue
 
-        component_name, field_name = normalized_path.split(".", 1)
-        meta = (pipeline_meta.get(component_name, {}) or {}).get(field_name, {}) or {}
-        resolved_type = meta.get("type")
+            component_name, field_name = normalized_path.split(".", 1)
+            meta = (pipeline_meta.get(component_name, {}) or {}).get(field_name, {}) or {}
+            resolved_type = meta.get("type")
 
-        resolutions[io_name] = InputResolution(
-            path=f"{component_name}.{field_name}",
-            component=component_name,
-            name=field_name,
-            type=resolved_type,
-            required=bool(meta.get("is_mandatory", False)),
-        )
+            resolutions[io_name].append(InputResolution(
+                path=f"{component_name}.{field_name}",
+                component=component_name,
+                name=field_name,
+                type=resolved_type,
+                required=bool(meta.get("is_mandatory", False)),
+            ))
 
-    return resolutions
+    return dict(resolutions)
 
 
 def _resolve_declared_outputs(
-    declared_map: dict[str, Any],
-    pipeline_meta: dict[str, dict[str, Any]],
+        declared_map: dict[str, Any],
+        pipeline_meta: dict[str, dict[str, Any]],
 ) -> dict[str, OutputResolution]:
     """
     Resolve declared output entries using the pipeline metadata.
