@@ -153,7 +153,7 @@ def get_inputs_outputs_from_yaml(yaml_source_code: str) -> ResolvedIO:
 
     pipeline = Pipeline.loads(yaml_source_code)
     pipeline_inputs = pipeline.inputs()
-    pipeline_outputs = pipeline.outputs()
+    pipeline_outputs = pipeline.outputs(include_components_with_connected_outputs=True)
 
     input_resolutions = _resolve_declared_inputs(declared_inputs, pipeline_inputs)
     output_resolutions = _resolve_declared_outputs(declared_outputs, pipeline_outputs)
