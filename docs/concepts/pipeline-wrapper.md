@@ -14,7 +14,7 @@ The pipeline wrapper provides a flexible foundation for deploying Haystack pipel
 
 ```python
 from pathlib import Path
-from typing import List, Generator, Union, AsyncGenerator
+from typing import Generator, Union, AsyncGenerator
 from haystack import Pipeline, AsyncPipeline
 from hayhooks import BasePipelineWrapper, get_last_user_message, streaming_generator, async_streaming_generator
 
@@ -23,7 +23,7 @@ class PipelineWrapper(BasePipelineWrapper):
         pipeline_yaml = (Path(__file__).parent / "pipeline.yml").read_text()
         self.pipeline = Pipeline.loads(pipeline_yaml)
 
-    def run_api(self, urls: List[str], question: str) -> str:
+    def run_api(self, urls: list[str], question: str) -> str:
         result = self.pipeline.run({"fetcher": {"urls": urls}, "prompt": {"query": question}})
         return result["llm"]["replies"][0]
 ```
@@ -108,7 +108,7 @@ def setup(self) -> None:
 The `run_api()` method is called for each API request to the `{pipeline_name}/run` endpoint.
 
 ```python
-def run_api(self, urls: List[str], question: str) -> str:
+def run_api(self, urls: list[str], question: str) -> str:
     result = self.pipeline.run({"fetcher": {"urls": urls}, "prompt": {"query": question}})
     return result["llm"]["replies"][0]
 ```
@@ -123,9 +123,9 @@ def run_api(self, urls: List[str], question: str) -> str:
 **Input argument rules:**
 
 - Arguments must be JSON-serializable
-- Use proper type hints (`List[str]`, `Optional[int]`, etc.)
+- Use proper type hints (`list[str]`, `Optional[int]`, etc.)
 - Default values are supported
-- Complex types like `Dict[str, Any]` are allowed
+- Complex types like `dict[str, Any]` are allowed
 
 ## Optional Methods
 
@@ -134,7 +134,7 @@ def run_api(self, urls: List[str], question: str) -> str:
 The asynchronous version of `run_api()` for better performance under high load.
 
 ```python
-async def run_api_async(self, urls: List[str], question: str) -> str:
+async def run_api_async(self, urls: list[str], question: str) -> str:
     result = await self.pipeline.run_async({"fetcher": {"urls": urls}, "prompt": {"query": question}})
     return result["llm"]["replies"][0]
 ```
@@ -151,7 +151,7 @@ async def run_api_async(self, urls: List[str], question: str) -> str:
 Enable OpenAI-compatible chat endpoints for integration with chat interfaces.
 
 ```python
-def run_chat_completion(self, model: str, messages: List[dict], body: dict) -> Union[str, Generator]:
+def run_chat_completion(self, model: str, messages: list[dict], body: dict) -> Union[str, Generator]:
     question = get_last_user_message(messages)
     result = self.pipeline.run({"prompt": {"query": question}})
     return result["llm"]["replies"][0]
@@ -168,13 +168,153 @@ def run_chat_completion(self, model: str, messages: List[dict], body: dict) -> U
 Async version of chat completion with streaming support.
 
 ```python
-async def run_chat_completion_async(self, model: str, messages: List[dict], body: dict) -> AsyncGenerator:
+async def run_chat_completion_async(self, model: str, messages: list[dict], body: dict) -> AsyncGenerator:
     question = get_last_user_message(messages)
     return async_streaming_generator(
         pipeline=self.pipeline,
         pipeline_run_args={"prompt": {"query": question}},
     )
 ```
+
+## Hybrid Streaming: Mixing Async and Sync Components
+
+!!! tip "Compatibility for Legacy Components"
+    When working with legacy pipelines or components that only support sync streaming callbacks (like `OpenAIGenerator`), use `allow_sync_streaming_callbacks=True` to enable hybrid mode. For new code, prefer async-compatible components and use the default strict mode.
+
+Some Haystack components only support synchronous streaming callbacks and don't have async equivalents. Examples include:
+
+- `OpenAIGenerator` - Legacy OpenAI text generation (⚠️ Note: `OpenAIChatGenerator` IS async-compatible)
+- Other components without `run_async()` support
+
+### The Problem
+
+By default, `async_streaming_generator` requires all streaming components to support async callbacks:
+
+```python
+async def run_chat_completion_async(self, model: str, messages: list[dict], body: dict) -> AsyncGenerator:
+    # This will FAIL if pipeline contains OpenAIGenerator
+    return async_streaming_generator(
+        pipeline=self.pipeline,  # AsyncPipeline with OpenAIGenerator
+        pipeline_run_args={"prompt": {"query": question}},
+    )
+```
+
+**Error:**
+
+```text
+ValueError: Component 'llm' of type 'OpenAIGenerator' seems to not support
+async streaming callbacks...
+```
+
+### The Solution: Hybrid Streaming Mode
+
+Enable hybrid streaming mode to automatically handle both async and sync components:
+
+```python
+async def run_chat_completion_async(self, model: str, messages: list[dict], body: dict) -> AsyncGenerator:
+    question = get_last_user_message(messages)
+    return async_streaming_generator(
+        pipeline=self.pipeline,
+        pipeline_run_args={"prompt": {"query": question}},
+        allow_sync_streaming_callbacks=True  # ✅ Auto-detect and enable hybrid mode
+    )
+```
+
+### What `allow_sync_streaming_callbacks=True` Does
+
+When you set `allow_sync_streaming_callbacks=True`, the system enables **intelligent auto-detection**:
+
+1. **Scans Components**: Automatically inspects all streaming components in your pipeline
+2. **Detects Capabilities**: Checks if each component has `run_async()` support
+3. **Enables Hybrid Mode Only If Needed**:
+   - ✅ If **all components support async** → Uses pure async mode (no overhead)
+   - ✅ If **any component is sync-only** → Automatically enables hybrid mode
+4. **Bridges Sync to Async**: For sync-only components, wraps their callbacks to work seamlessly with the async event loop
+5. **Zero Configuration**: You don't need to know which components are sync/async - it figures it out automatically
+
+!!! success "Smart Behavior"
+    Setting `allow_sync_streaming_callbacks=True` does NOT force hybrid mode. It only enables it when actually needed. If your pipeline is fully async-capable, you get pure async performance with no overhead!
+
+### Configuration Options
+
+```python
+# Option 1: Strict mode (Default - Recommended)
+allow_sync_streaming_callbacks=False
+# → Raises error if sync-only components found
+# → Best for: New code, ensuring proper async components, best performance
+
+# Option 2: Auto-detection (Compatibility mode)
+allow_sync_streaming_callbacks=True
+# → Automatically detects and enables hybrid mode only when needed
+# → Best for: Legacy pipelines, components without async support, gradual migration
+```
+
+### Example: Legacy OpenAI Generator with Async Pipeline
+
+```python
+from typing import AsyncGenerator
+from haystack import AsyncPipeline
+from haystack.components.builders import PromptBuilder
+from haystack.components.generators import OpenAIGenerator
+from haystack.utils import Secret
+from hayhooks import BasePipelineWrapper, get_last_user_message, async_streaming_generator
+
+class LegacyOpenAIWrapper(BasePipelineWrapper):
+    def setup(self) -> None:
+        # OpenAIGenerator only supports sync streaming (legacy component)
+        llm = OpenAIGenerator(
+            api_key=Secret.from_env_var("OPENAI_API_KEY"),
+            model="gpt-4o-mini"
+        )
+
+        prompt_builder = PromptBuilder(
+            template="Answer this question: {{question}}"
+        )
+
+        self.pipeline = AsyncPipeline()
+        self.pipeline.add_component("prompt", prompt_builder)
+        self.pipeline.add_component("llm", llm)
+        self.pipeline.connect("prompt.prompt", "llm.prompt")
+
+    async def run_chat_completion_async(
+        self, model: str, messages: list[dict], body: dict
+    ) -> AsyncGenerator:
+        question = get_last_user_message(messages)
+
+        # Enable hybrid mode for OpenAIGenerator
+        return async_streaming_generator(
+            pipeline=self.pipeline,
+            pipeline_run_args={"prompt": {"question": question}},
+            allow_sync_streaming_callbacks=True  # ✅ Handles sync component
+        )
+```
+
+### When to Use Each Mode
+
+**Use strict mode (default) when:**
+
+- Building new pipelines (recommended default)
+- You want to ensure all components are **async-compatible**
+- Performance is critical (pure async is **~1-2μs faster** per chunk)
+- You're building a production system with controlled dependencies
+
+**Use `allow_sync_streaming_callbacks=True` when:**
+
+- Working with legacy pipelines that use `OpenAIGenerator` or other sync-only components
+- Deploying YAML pipelines with unknown/legacy component types
+- Migrating old code that doesn't have async equivalents yet
+- Third-party components without async support
+
+### Performance Considerations
+
+- **Pure async pipeline**: No overhead
+- **Hybrid mode (auto-detected)**: Minimal overhead (~1-2 microseconds per streaming chunk for sync components)
+- **Network-bound operations**: The overhead is negligible compared to LLM generation time
+
+!!! success "Best Practice"
+    **For new code**: Use the default strict mode (`allow_sync_streaming_callbacks=False`) to ensure you're using proper async components.
+
+    **For legacy/compatibility**: Use `allow_sync_streaming_callbacks=True` when working with older pipelines or components that don't support async streaming yet.
 
 ## Streaming from Multiple Components
 
@@ -229,7 +369,7 @@ class MultiLLMWrapper(BasePipelineWrapper):
         self.pipeline.connect("llm_1.replies", "prompt_2.previous_response")
         self.pipeline.connect("prompt_2.prompt", "llm_2.messages")
 
-    def run_chat_completion(self, model: str, messages: List[dict], body: dict) -> Generator:
+    def run_chat_completion(self, model: str, messages: list[dict], body: dict) -> Generator:
         question = get_last_user_message(messages)
 
         # By default, only llm_2 (the last streaming component) will stream
@@ -246,7 +386,7 @@ class MultiLLMWrapper(BasePipelineWrapper):
 For advanced use cases where you want to see outputs from multiple components, use the `streaming_components` parameter:
 
 ```python
-def run_chat_completion(self, model: str, messages: List[dict], body: dict) -> Generator:
+def run_chat_completion(self, model: str, messages: list[dict], body: dict) -> Generator:
     question = get_last_user_message(messages)
 
     # Enable streaming for BOTH LLMs
@@ -362,15 +502,101 @@ YAML configuration follows the same priority rules: YAML setting > environment v
 
 See the [Multi-LLM Streaming Example](https://github.com/deepset-ai/hayhooks/tree/main/examples/pipeline_wrappers/multi_llm_streaming) for a complete working implementation.
 
+## Accessing Intermediate Outputs with `include_outputs_from`
+
+!!! info "Understanding Pipeline Outputs"
+    By default, Haystack pipelines only return outputs from **leaf components** (final components with no downstream connections). Use `include_outputs_from` to also get outputs from intermediate components like retrievers, preprocessors, or parallel branches.
+
+### Streaming with `on_pipeline_end` Callback
+
+For streaming responses, pass `include_outputs_from` to `streaming_generator()` or `async_streaming_generator()`, and use the `on_pipeline_end` callback to access intermediate outputs. For example:
+
+```python
+    def run_chat_completion(self, model: str, messages: List[dict], body: dict) -> Generator:
+        question = get_last_user_message(messages)
+
+        # Store retrieved documents for citations
+        self.retrieved_docs = []
+
+        def on_pipeline_end(result: dict[str, Any]) -> None:
+            # Access intermediate outputs here
+            if "retriever" in result:
+                self.retrieved_docs = result["retriever"]["documents"]
+                # Use for citations, logging, analytics, etc.
+
+        return streaming_generator(
+            pipeline=self.pipeline,
+            pipeline_run_args={
+                "retriever": {"query": question},
+                "prompt_builder": {"query": question}
+            },
+            include_outputs_from={"retriever"},  # Make retriever outputs available
+            on_pipeline_end=on_pipeline_end
+        )
+```
+
+**What happens:** The `on_pipeline_end` callback receives both `llm` and `retriever` outputs in the `result` dict, allowing you to access retrieved documents alongside the generated response.
+
+The same pattern works with async streaming:
+
+```python
+async def run_chat_completion_async(self, model: str, messages: List[dict], body: dict) -> AsyncGenerator:
+    question = get_last_user_message(messages)
+
+    def on_pipeline_end(result: dict[str, Any]) -> None:
+        if "retriever" in result:
+            self.retrieved_docs = result["retriever"]["documents"]
+
+    return async_streaming_generator(
+        pipeline=self.async_pipeline,
+        pipeline_run_args={
+            "retriever": {"query": question},
+            "prompt_builder": {"query": question}
+        },
+        include_outputs_from={"retriever"},
+        on_pipeline_end=on_pipeline_end
+    )
+```
+
+### Non-Streaming API
+
+For non-streaming `run_api` or `run_api_async` endpoints, pass `include_outputs_from` directly to `pipeline.run()` or `pipeline.run_async()`. For example:
+
+```python
+def run_api(self, query: str) -> dict:
+    result = self.pipeline.run(
+        data={"retriever": {"query": query}},
+        include_outputs_from={"retriever"}
+    )
+    # Build custom response with both answer and sources
+    return {"answer": result["llm"]["replies"][0], "sources": result["retriever"]["documents"]}
+```
+
+Same pattern for async:
+
+```python
+async def run_api_async(self, query: str) -> dict:
+    result = await self.async_pipeline.run_async(
+        data={"retriever": {"query": query}},
+        include_outputs_from={"retriever"}
+    )
+    return {"answer": result["llm"]["replies"][0], "sources": result["retriever"]["documents"]}
+```
+
+!!! tip "When to Use `include_outputs_from`"
+    - **Streaming**: Pass `include_outputs_from` to `streaming_generator()` or `async_streaming_generator()` and use `on_pipeline_end` callback to access the outputs
+    - **Non-streaming**: Pass `include_outputs_from` directly to `pipeline.run()` or `pipeline.run_async()`
+    - **YAML Pipelines**: Automatically handled - see [YAML Pipeline Deployment](yaml-pipeline-deployment.md#output-mapping)
+
 ## File Upload Support
 
 Hayhooks can handle file uploads by adding a `files` parameter:
 
 ```python
 from fastapi import UploadFile
-from typing import Optional, List
+from typing import Optional
 
-def run_api(self, files: Optional[List[UploadFile]] = None, query: str = "") -> str:
+def run_api(self, files: Optional[list[UploadFile]] = None, query: str = "") -> str:
     if files:
         # Process uploaded files
         filenames = [f.filename for f in files if f.filename]
@@ -415,7 +641,7 @@ Your pipeline wrapper may require additional dependencies:
 # pipeline_wrapper.py
 import trafilatura  # Additional dependency
 
-def run_api(self, urls: List[str], question: str) -> str:
+def run_api(self, urls: list[str], question: str) -> str:
     # Use additional library
     content = trafilatura.fetch(urls[0])
     # ... rest of pipeline logic
@@ -483,7 +709,7 @@ class PipelineWrapper(BasePipelineWrapper):
 Use docstrings to provide MCP tool descriptions:
 
 ```python
-def run_api(self, urls: List[str], question: str) -> str:
+def run_api(self, urls: list[str], question: str) -> str:
     """
     Ask questions about website content.
 
